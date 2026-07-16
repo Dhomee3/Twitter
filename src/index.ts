@@ -1187,6 +1187,20 @@ async function main() {
     console.log(`Health check listening on port ${port}`);
   });
 
+  // Keep-alive: ping own URL every 14 minutes to prevent Render sleep
+  const selfUrl = process.env["RENDER_URL"];
+  if (selfUrl) {
+    const ping = selfUrl.startsWith("https") ? require("https") : require("http");
+    setInterval(() => {
+      ping.get(selfUrl, (res: any) => {
+        console.log(`Keep-alive ping → ${res.statusCode}`);
+      }).on("error", (e: any) => {
+        console.warn(`Keep-alive ping failed: ${e.message}`);
+      });
+    }, 14 * 60 * 1000);
+    console.log(`Keep-alive enabled → ${selfUrl}`);
+  }
+
   await startBot();
 }
 
