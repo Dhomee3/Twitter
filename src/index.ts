@@ -23,21 +23,161 @@ import {
   type TextChannel,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
-import { db } from "@workspace/db";
-import {
-  twitterSettingsTable,
-  twitterAccountsTable,
-  twitterTweetsTable,
-  twitterLikesTable,
-  twitterFollowsTable,
-  twitterCommentsTable,
-  twitterLogsTable,
-  type TwitterAccount,
-  type TwitterTweet,
-  type TwitterComment,
-} from "@workspace/db";
-import { eq, and, sql, count, desc, ilike } from "drizzle-orm";
-import { logger } from "../lib/logger";
+import mongoose, { Schema } from "mongoose";
+import http from "http";
+
+// ═══════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════
+
+type TwitterAccount = {
+  id: number;
+  discordUserId: string;
+  guildId: string;
+  username: string;
+  displayName: string;
+  verified: boolean;
+  starred: boolean;
+  banned: boolean;
+  avatarUrl: string | null;
+  bonusFollowers: number;
+  createdAt: Date;
+};
+
+type TwitterTweet = {
+  id: number;
+  authorId: number | null;
+  guildId: string;
+  content: string;
+  imageUrl: string | null;
+  messageId: string | null;
+  channelId: string | null;
+  likeCount: number;
+  createdAt: Date;
+};
+
+type TwitterComment = {
+  id: number;
+  tweetId: number | null;
+  authorId: number | null;
+  content: string;
+  createdAt: Date;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  MONGODB SCHEMAS & MODELS
+// ═══════════════════════════════════════════════════════════════════
+
+const CounterSchema = new Schema({ _id: String, seq: { type: Number, default: 0 } });
+const Counter = mongoose.model("Counter", CounterSchema);
+
+async function nextId(name: string): Promise<number> {
+  const doc = await Counter.findByIdAndUpdate(
+    name,
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return doc!.seq;
+}
+
+const SettingsSchema = new Schema({
+  guildId: { type: String, required: true, unique: true },
+  tweetChannelId: String,
+  logChannelId: String,
+});
+const Settings = mongoose.model("Settings", SettingsSchema);
+
+const AccountSchema = new Schema({
+  id: { type: Number, unique: true },
+  discordUserId: { type: String, required: true },
+  guildId: { type: String, required: true },
+  username: { type: String, required: true },
+  displayName: { type: String, required: true },
+  verified: { type: Boolean, default: false },
+  starred: { type: Boolean, default: false },
+  banned: { type: Boolean, default: false },
+  avatarUrl: String,
+  bonusFollowers: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+});
+AccountSchema.index({ discordUserId: 1, guildId: 1 }, { unique: true });
+AccountSchema.index({ username: 1, guildId: 1 }, { unique: true });
+const Account = mongoose.model("Account", AccountSchema);
+
+const TweetSchema = new Schema({
+  id: { type: Number, unique: true },
+  authorId: Number,
+  guildId: { type: String, required: true },
+  content: { type: String, required: true },
+  imageUrl: String,
+  messageId: String,
+  channelId: String,
+  likeCount: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+});
+const Tweet = mongoose.model("Tweet", TweetSchema);
+
+const LikeSchema = new Schema({
+  accountId: { type: Number, required: true },
+  tweetId: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+LikeSchema.index({ accountId: 1, tweetId: 1 }, { unique: true });
+const Like = mongoose.model("Like", LikeSchema);
+
+const FollowSchema = new Schema({
+  followerId: { type: Number, required: true },
+  followingId: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+FollowSchema.index({ followerId: 1, followingId: 1 }, { unique: true });
+const Follow = mongoose.model("Follow", FollowSchema);
+
+const CommentSchema = new Schema({
+  id: { type: Number, unique: true },
+  tweetId: Number,
+  authorId: Number,
+  content: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+const Comment = mongoose.model("Comment", CommentSchema);
+
+const LogSchema = new Schema({
+  guildId: { type: String, required: true },
+  action: { type: String, required: true },
+  targetDiscordId: String,
+  moderatorDiscordId: String,
+  details: String,
+  createdAt: { type: Date, default: Date.now },
+});
+const Log = mongoose.model("Log", LogSchema);
+
+// ═══════════════════════════════════════════════════════════════════
+//  DOC → TYPE CONVERTERS
+// ═══════════════════════════════════════════════════════════════════
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toAccount(d: any): TwitterAccount {
+  return {
+    id: d.id, discordUserId: d.discordUserId, guildId: d.guildId,
+    username: d.username, displayName: d.displayName,
+    verified: d.verified ?? false, starred: d.starred ?? false, banned: d.banned ?? false,
+    avatarUrl: d.avatarUrl ?? null, bonusFollowers: d.bonusFollowers ?? 0,
+    createdAt: d.createdAt ?? new Date(),
+  };
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toTweet(d: any): TwitterTweet {
+  return {
+    id: d.id, authorId: d.authorId ?? null, guildId: d.guildId, content: d.content,
+    imageUrl: d.imageUrl ?? null, messageId: d.messageId ?? null, channelId: d.channelId ?? null,
+    likeCount: d.likeCount ?? 0, createdAt: d.createdAt ?? new Date(),
+  };
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toComment(d: any): TwitterComment {
+  return { id: d.id, tweetId: d.tweetId ?? null, authorId: d.authorId ?? null, content: d.content, createdAt: d.createdAt ?? new Date() };
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  MODULE-LEVEL CLIENT REF
@@ -56,35 +196,30 @@ const ADMIN_ROLE_ID = "1515771920174551051";
 // ═══════════════════════════════════════════════════════════════════
 
 async function getSettings(guildId: string) {
-  const [row] = await db.select().from(twitterSettingsTable).where(eq(twitterSettingsTable.guildId, guildId));
-  return row ?? null;
+  return Settings.findOne({ guildId }).lean();
 }
 
 async function setTweetChannel(guildId: string, channelId: string) {
-  await db.insert(twitterSettingsTable).values({ guildId, tweetChannelId: channelId })
-    .onConflictDoUpdate({ target: twitterSettingsTable.guildId, set: { tweetChannelId: channelId } });
+  await Settings.findOneAndUpdate({ guildId }, { $set: { tweetChannelId: channelId } }, { upsert: true });
 }
 
 async function setLogChannel(guildId: string, channelId: string) {
-  await db.insert(twitterSettingsTable).values({ guildId, logChannelId: channelId })
-    .onConflictDoUpdate({ target: twitterSettingsTable.guildId, set: { logChannelId: channelId } });
+  await Settings.findOneAndUpdate({ guildId }, { $set: { logChannelId: channelId } }, { upsert: true });
 }
 
 async function getAccount(discordUserId: string, guildId: string): Promise<TwitterAccount | null> {
-  const [row] = await db.select().from(twitterAccountsTable)
-    .where(and(eq(twitterAccountsTable.discordUserId, discordUserId), eq(twitterAccountsTable.guildId, guildId)));
-  return row ?? null;
+  const d = await Account.findOne({ discordUserId, guildId }).lean();
+  return d ? toAccount(d) : null;
 }
 
 async function getAccountById(id: number): Promise<TwitterAccount | null> {
-  const [row] = await db.select().from(twitterAccountsTable).where(eq(twitterAccountsTable.id, id));
-  return row ?? null;
+  const d = await Account.findOne({ id }).lean();
+  return d ? toAccount(d) : null;
 }
 
 async function getAccountByUsername(username: string, guildId: string): Promise<TwitterAccount | null> {
-  const [row] = await db.select().from(twitterAccountsTable)
-    .where(and(ilike(twitterAccountsTable.username, username.replace("@", "")), eq(twitterAccountsTable.guildId, guildId)));
-  return row ?? null;
+  const d = await Account.findOne({ username: new RegExp(`^${username.replace("@", "")}$`, "i"), guildId }).lean();
+  return d ? toAccount(d) : null;
 }
 
 async function resolveTarget(target: string, guildId: string): Promise<TwitterAccount | null> {
@@ -93,137 +228,139 @@ async function resolveTarget(target: string, guildId: string): Promise<TwitterAc
 }
 
 async function createAccount(discordUserId: string, guildId: string, username: string, displayName: string, avatarUrl: string | null): Promise<TwitterAccount> {
-  const [row] = await db.insert(twitterAccountsTable).values({ discordUserId, guildId, username, displayName, avatarUrl }).returning();
-  return row!;
+  const id = await nextId("account");
+  const d = await Account.create({ id, discordUserId, guildId, username, displayName, avatarUrl, createdAt: new Date() });
+  return toAccount(d);
 }
 
 async function updateAvatar(id: number, avatarUrl: string) {
-  await db.update(twitterAccountsTable).set({ avatarUrl }).where(eq(twitterAccountsTable.id, id));
+  await Account.updateOne({ id }, { $set: { avatarUrl } });
 }
 
 async function changeUsername(id: number, newUsername: string) {
-  await db.update(twitterAccountsTable).set({ username: newUsername }).where(eq(twitterAccountsTable.id, id));
+  await Account.updateOne({ id }, { $set: { username: newUsername } });
 }
 
 async function verifyAccount(id: number, state: boolean) {
-  await db.update(twitterAccountsTable).set({ verified: state }).where(eq(twitterAccountsTable.id, id));
+  await Account.updateOne({ id }, { $set: { verified: state } });
 }
 
 async function starAccount(id: number, state: boolean) {
-  await db.update(twitterAccountsTable).set({ starred: state }).where(eq(twitterAccountsTable.id, id));
+  await Account.updateOne({ id }, { $set: { starred: state } });
 }
 
 async function banAccount(id: number, state: boolean) {
-  await db.update(twitterAccountsTable).set({ banned: state }).where(eq(twitterAccountsTable.id, id));
+  await Account.updateOne({ id }, { $set: { banned: state } });
 }
 
 async function deleteAccount(id: number) {
-  await db.delete(twitterAccountsTable).where(eq(twitterAccountsTable.id, id));
+  await Account.deleteOne({ id });
+  await Tweet.deleteMany({ authorId: id });
+  await Like.deleteMany({ accountId: id });
+  await Follow.deleteMany({ $or: [{ followerId: id }, { followingId: id }] });
+  await Comment.deleteMany({ authorId: id });
 }
 
 async function addBonusFollowers(accountId: number, amount: number) {
-  await db.update(twitterAccountsTable)
-    .set({ bonusFollowers: sql`${twitterAccountsTable.bonusFollowers} + ${amount}` })
-    .where(eq(twitterAccountsTable.id, accountId));
-}
-
-async function createTweet(authorId: number, guildId: string, content: string, imageUrl?: string): Promise<TwitterTweet> {
-  const [row] = await db.insert(twitterTweetsTable).values({ authorId, guildId, content, imageUrl: imageUrl ?? null }).returning();
-  return row!;
-}
-
-async function getTweet(id: number): Promise<TwitterTweet | null> {
-  const [row] = await db.select().from(twitterTweetsTable).where(eq(twitterTweetsTable.id, id));
-  return row ?? null;
-}
-
-async function updateTweetMessage(id: number, messageId: string, channelId: string) {
-  await db.update(twitterTweetsTable).set({ messageId, channelId }).where(eq(twitterTweetsTable.id, id));
-}
-
-async function deleteTweet(id: number) {
-  await db.delete(twitterTweetsTable).where(eq(twitterTweetsTable.id, id));
-}
-
-async function addBonusLikes(tweetId: number, amount: number) {
-  await db.update(twitterTweetsTable)
-    .set({ likeCount: sql`${twitterTweetsTable.likeCount} + ${amount}` })
-    .where(eq(twitterTweetsTable.id, tweetId));
+  await Account.updateOne({ id: accountId }, { $inc: { bonusFollowers: amount } });
 }
 
 async function removeBonusFollowers(accountId: number, amount: number) {
-  await db.update(twitterAccountsTable)
-    .set({ bonusFollowers: sql`GREATEST(0, ${twitterAccountsTable.bonusFollowers} - ${amount})` })
-    .where(eq(twitterAccountsTable.id, accountId));
+  const d = await Account.findOne({ id: accountId });
+  if (!d) return;
+  await Account.updateOne({ id: accountId }, { $set: { bonusFollowers: Math.max(0, (d.bonusFollowers ?? 0) - amount) } });
+}
+
+async function createTweet(authorId: number, guildId: string, content: string, imageUrl?: string): Promise<TwitterTweet> {
+  const id = await nextId("tweet");
+  const d = await Tweet.create({ id, authorId, guildId, content, imageUrl: imageUrl ?? null, createdAt: new Date() });
+  return toTweet(d);
+}
+
+async function getTweet(id: number): Promise<TwitterTweet | null> {
+  const d = await Tweet.findOne({ id }).lean();
+  return d ? toTweet(d) : null;
+}
+
+async function updateTweetMessage(id: number, messageId: string, channelId: string) {
+  await Tweet.updateOne({ id }, { $set: { messageId, channelId } });
+}
+
+async function deleteTweet(id: number) {
+  await Tweet.deleteOne({ id });
+  await Like.deleteMany({ tweetId: id });
+  await Comment.deleteMany({ tweetId: id });
+}
+
+async function addBonusLikes(tweetId: number, amount: number) {
+  await Tweet.updateOne({ id: tweetId }, { $inc: { likeCount: amount } });
 }
 
 async function removeBonusLikes(tweetId: number, amount: number) {
-  await db.update(twitterTweetsTable)
-    .set({ likeCount: sql`GREATEST(0, ${twitterTweetsTable.likeCount} - ${amount})` })
-    .where(eq(twitterTweetsTable.id, tweetId));
+  const d = await Tweet.findOne({ id: tweetId });
+  if (!d) return;
+  await Tweet.updateOne({ id: tweetId }, { $set: { likeCount: Math.max(0, (d.likeCount ?? 0) - amount) } });
 }
 
-async function getAllAccounts(guildId: string) {
-  return db.select().from(twitterAccountsTable)
-    .where(eq(twitterAccountsTable.guildId, guildId))
-    .orderBy(desc(twitterAccountsTable.createdAt));
+async function getAllAccounts(guildId: string): Promise<TwitterAccount[]> {
+  const docs = await Account.find({ guildId }).sort({ createdAt: -1 }).lean();
+  return docs.map(toAccount);
 }
 
 async function toggleLike(accountId: number, tweetId: number): Promise<boolean> {
-  const [existing] = await db.select().from(twitterLikesTable)
-    .where(and(eq(twitterLikesTable.accountId, accountId), eq(twitterLikesTable.tweetId, tweetId)));
+  const existing = await Like.findOne({ accountId, tweetId });
   if (existing) {
-    await db.delete(twitterLikesTable).where(and(eq(twitterLikesTable.accountId, accountId), eq(twitterLikesTable.tweetId, tweetId)));
-    await db.update(twitterTweetsTable).set({ likeCount: sql`GREATEST(0, ${twitterTweetsTable.likeCount} - 1)` }).where(eq(twitterTweetsTable.id, tweetId));
+    await Like.deleteOne({ accountId, tweetId });
+    const d = await Tweet.findOne({ id: tweetId });
+    await Tweet.updateOne({ id: tweetId }, { $set: { likeCount: Math.max(0, (d?.likeCount ?? 1) - 1) } });
     return false;
   } else {
-    await db.insert(twitterLikesTable).values({ accountId, tweetId }).onConflictDoNothing();
-    await db.update(twitterTweetsTable).set({ likeCount: sql`${twitterTweetsTable.likeCount} + 1` }).where(eq(twitterTweetsTable.id, tweetId));
+    await Like.create({ accountId, tweetId });
+    await Tweet.updateOne({ id: tweetId }, { $inc: { likeCount: 1 } });
     return true;
   }
 }
 
 async function getFollowersCount(accountId: number): Promise<number> {
-  const [realRow] = await db.select({ cnt: count() }).from(twitterFollowsTable).where(eq(twitterFollowsTable.followingId, accountId));
-  const [bonusRow] = await db.select({ bonus: twitterAccountsTable.bonusFollowers }).from(twitterAccountsTable).where(eq(twitterAccountsTable.id, accountId));
-  return (realRow?.cnt ?? 0) + (bonusRow?.bonus ?? 0);
+  const [real, bonusDoc] = await Promise.all([
+    Follow.countDocuments({ followingId: accountId }),
+    Account.findOne({ id: accountId }, { bonusFollowers: 1 }).lean(),
+  ]);
+  return real + (bonusDoc?.bonusFollowers ?? 0);
 }
 
 async function getFollowingCount(accountId: number): Promise<number> {
-  const [row] = await db.select({ cnt: count() }).from(twitterFollowsTable).where(eq(twitterFollowsTable.followerId, accountId));
-  return row?.cnt ?? 0;
+  return Follow.countDocuments({ followerId: accountId });
 }
 
 async function toggleFollow(followerId: number, followingId: number): Promise<boolean | null> {
   if (followerId === followingId) return null;
-  const [existing] = await db.select().from(twitterFollowsTable)
-    .where(and(eq(twitterFollowsTable.followerId, followerId), eq(twitterFollowsTable.followingId, followingId)));
+  const existing = await Follow.findOne({ followerId, followingId });
   if (existing) {
-    await db.delete(twitterFollowsTable).where(and(eq(twitterFollowsTable.followerId, followerId), eq(twitterFollowsTable.followingId, followingId)));
+    await Follow.deleteOne({ followerId, followingId });
     return false;
   } else {
-    await db.insert(twitterFollowsTable).values({ followerId, followingId }).onConflictDoNothing();
+    await Follow.create({ followerId, followingId });
     return true;
   }
 }
 
 async function createComment(tweetId: number, authorId: number, content: string): Promise<TwitterComment> {
-  const [row] = await db.insert(twitterCommentsTable).values({ tweetId, authorId, content }).returning();
-  return row!;
+  const id = await nextId("comment");
+  const d = await Comment.create({ id, tweetId, authorId, content, createdAt: new Date() });
+  return toComment(d);
 }
 
 async function getCommentsCount(tweetId: number): Promise<number> {
-  const [row] = await db.select({ cnt: count() }).from(twitterCommentsTable).where(eq(twitterCommentsTable.tweetId, tweetId));
-  return row?.cnt ?? 0;
+  return Comment.countDocuments({ tweetId });
 }
 
 async function getTweetCount(authorId: number): Promise<number> {
-  const [row] = await db.select({ cnt: count() }).from(twitterTweetsTable).where(eq(twitterTweetsTable.authorId, authorId));
-  return row?.cnt ?? 0;
+  return Tweet.countDocuments({ authorId });
 }
 
 async function addLog(guildId: string, action: string, targetDiscordId: string | null, modDiscordId: string | null, details: string | null) {
-  await db.insert(twitterLogsTable).values({ guildId, action, targetDiscordId, moderatorDiscordId: modDiscordId, details });
+  await Log.create({ guildId, action, targetDiscordId, moderatorDiscordId: modDiscordId, details });
   if (!botClient) return;
   try {
     const settings = await getSettings(guildId);
@@ -245,7 +382,7 @@ async function addLog(guildId: string, action: string, targetDiscordId: string |
 }
 
 async function getLogs(guildId: string, limit = 10) {
-  return db.select().from(twitterLogsTable).where(eq(twitterLogsTable.guildId, guildId)).orderBy(desc(twitterLogsTable.createdAt)).limit(limit);
+  return Log.find({ guildId }).sort({ createdAt: -1 }).limit(limit).lean();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -312,6 +449,7 @@ function fmtNum(n: number): string {
 }
 
 function tweetEmbed(tweet: TwitterTweet, account: TwitterAccount, followers: number, comments: number) {
+  void followers;
   const embed = new EmbedBuilder().setColor(C.BLUE)
     .setAuthor({ name: `${badge(account)}${account.displayName} (@${account.username})`.trim(), iconURL: account.avatarUrl ?? undefined })
     .setDescription(tweet.content)
@@ -357,13 +495,13 @@ function profileEmbed(account: TwitterAccount, followers: number, tweets: number
 }
 
 function citizenPanel() {
-  const embed = new EmbedBuilder().setColor(0x1a2f6e) 
+  const embed = new EmbedBuilder().setColor(0x1a2f6e)
     .setTitle("مـنـصـة تـويـتـر ( X )")
     .setDescription("مرحباً! اختر ما تريد القيام به من القائمة أدناه:")
     .addFields(
       { name: "📝 إنشاء حساب", value: "أنشئ حسابك على Twitter X", inline: true },
       { name: "🐦 إرسال تغريدة", value: "شارك تغريدة جديدة", inline: true },
-      { name: "👤 عرض حسابي", value: "اعرض ملفك الشخصي", inline: true }, 
+      { name: "👤 عرض حسابي", value: "اعرض ملفك الشخصي", inline: true },
     )
     .setFooter({ text: "🐦 X  •  © FTRP" });
 
@@ -371,14 +509,14 @@ function citizenPanel() {
     new StringSelectMenuBuilder().setCustomId("select_citizen").setPlaceholder("اختر خياراً...").addOptions([
       { label: "إنشاء حساب", description: "أنشئ حسابك على Twitter X", value: "register", emoji: "📝" },
       { label: "إرسال تغريدة", description: "شارك تغريدة جديدة", value: "tweet", emoji: "🐦" },
-      { label: "عرض حسابي", description: "اعرض ملفك الشخصي", value: "profile", emoji: "👤" }, 
+      { label: "عرض حسابي", description: "اعرض ملفك الشخصي", value: "profile", emoji: "👤" },
     ]),
   );
   return { embed, menu };
 }
 
 function adminPanel() {
-  const embed = new EmbedBuilder().setColor(0x1a2f6e) 
+  const embed = new EmbedBuilder().setColor(0x1a2f6e)
     .setTitle("⚙️ بانل الإدارة")
     .setDescription("اختر الإجراء الذي تريد اتخاذه:")
     .addFields(
@@ -431,7 +569,7 @@ function err(title: string, desc: string) {
 function logsEmbed(logs: Awaited<ReturnType<typeof getLogs>>) {
   const embed = new EmbedBuilder().setColor(C.PURPLE).setTitle("📋 سجل الإجراءات").setTimestamp();
   if (!logs.length) return embed.setDescription("لا توجد سجلات حتى الآن.").setFooter({ text: "لا توجد سجلات  •  © FTRP" });
-  const lines = logs.map((l) => {
+  const lines = logs.map((l: any) => {
     const ts = Math.floor((l.createdAt ?? new Date()).getTime() / 1000);
     const mod = l.moderatorDiscordId ? `<@${l.moderatorDiscordId}>` : "النظام";
     const target = l.targetDiscordId ? `<@${l.targetDiscordId}>` : "—";
@@ -444,6 +582,7 @@ function logsEmbed(logs: Awaited<ReturnType<typeof getLogs>>) {
 //  INTERACTION HANDLERS
 // ═══════════════════════════════════════════════════════════════════
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleCommand(i: ChatInputCommandInteraction): Promise<any> {
   const sub = i.options.getSubcommand();
 
@@ -471,6 +610,7 @@ async function handleCommand(i: ChatInputCommandInteraction): Promise<any> {
   return;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleSelectMenu(i: StringSelectMenuInteraction): Promise<any> {
   const v = i.values[0]!;
 
@@ -595,7 +735,7 @@ async function handleSelectMenu(i: StringSelectMenuInteraction): Promise<any> {
       await i.deferReply({ ephemeral: true });
       const accounts = await getAllAccounts(i.guildId!);
       if (!accounts.length) return i.editReply({ embeds: [err("لا توجد حسابات", "لم يُسجَّل أي حساب بعد.")] });
-      const lines = accounts.slice(0, 25).map((a, idx) => {
+      const lines = accounts.slice(0, 25).map((a: any, idx: number) => {
         const status = a.banned ? "🚫" : "✅";
         const badges = `${a.verified ? "✅" : ""}${a.starred ? "⭐" : ""}`;
         return `**${idx + 1}.** ${badges} **${a.displayName}** (@${a.username}) ${status} — <@${a.discordUserId}>`;
@@ -638,6 +778,7 @@ async function handleSelectMenu(i: StringSelectMenuInteraction): Promise<any> {
   return;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleModal(i: ModalSubmitInteraction): Promise<any> {
   const { customId } = i;
 
@@ -678,7 +819,6 @@ async function handleModal(i: ModalSubmitInteraction): Promise<any> {
     return i.editReply({ embeds: [ok("تم إرسال التغريدة! 🐦", "تم إرسال تغريدتك بنجاح.")] });
   }
 
-  // ---  تعليقات الثريد الجديد ---
   if (customId.startsWith("modal_comment")) {
     await i.deferReply({ ephemeral: true });
     const parts = customId.split("_");
@@ -687,21 +827,20 @@ async function handleModal(i: ModalSubmitInteraction): Promise<any> {
     const content = i.fields.getTextInputValue("content").trim();
     const account = await getAccount(i.user.id, i.guildId!);
     if (!account || account.banned) return i.editReply({ embeds: [err("خطأ", account?.banned ? "حسابك محظور." : "لا يوجد حساب.")] });
-    
+
     const tweet = await getTweet(tweetId);
     if (!tweet || !tweet.messageId || !tweet.channelId) return i.editReply({ embeds: [err("خطأ", "التغريدة غير موجودة أو لا يمكن التعليق عليها.")] });
 
     // التحقق من تعليق واحد فقط
-    const [existing] = await db.select().from(twitterCommentsTable)
-      .where(and(eq(twitterCommentsTable.authorId, account.id), eq(twitterCommentsTable.tweetId, tweetId)));
-    if (existing) return i.editReply({ embeds: [err("خطأ", "لا يمكنك التعليق على التغريدة أكثر من مرة.")] });
+    const existingComment = await Comment.findOne({ authorId: account.id, tweetId });
+    if (existingComment) return i.editReply({ embeds: [err("خطأ", "لا يمكنك التعليق على التغريدة أكثر من مرة.")] });
 
     const comment = await createComment(tweetId, account.id, content);
-    
+
     try {
       const tweetCh = await i.client.channels.fetch(tweet.channelId) as TextChannel;
       const originalMsg = await tweetCh.messages.fetch(tweet.messageId);
-      
+
       // إنشاء ثريد أو جلب الثريد الموجود
       let thread = originalMsg.thread;
       if (!thread) {
@@ -710,16 +849,16 @@ async function handleModal(i: ModalSubmitInteraction): Promise<any> {
           autoArchiveDuration: 1440,
         });
         // منع الأعضاء من الكتابة في الثريد (باستثناء البوت)
-        await thread.permissionOverwrites.edit(i.guildId!, { SendMessages: false });
+        await (thread as any).permissionOverwrites?.edit(i.guildId!, { SendMessages: false });
       }
 
       // إرسال التعليق داخل الثريد
       await thread.send({ embeds: [commentEmbed(comment, account, tweetId)] });
-      
+
       // تحديث عداد التعليقات في الرسالة الأصلية
       const [f, c] = await Promise.all([getFollowersCount(account.id), getCommentsCount(tweetId)]);
-      await originalMsg.edit({ embeds: [tweetEmbed(tweet, account, f, c)], components: [tweetButtons(tweetId, tweet.authorId, tweet.likeCount ?? 0)] });
-      
+      await originalMsg.edit({ embeds: [tweetEmbed(tweet, account, f, c)], components: [tweetButtons(tweetId, tweet.authorId!, tweet.likeCount ?? 0)] });
+
     } catch (e) {
       console.error(e);
       return i.editReply({ embeds: [err("خطأ", "فشل إنشاء الثريد أو إرسال التعليق.")] });
@@ -932,6 +1071,7 @@ async function handleModal(i: ModalSubmitInteraction): Promise<any> {
   return;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleButton(i: ButtonInteraction): Promise<any> {
   const { customId } = i;
 
@@ -993,7 +1133,7 @@ async function handleInteraction(interaction: Interaction) {
     else if (interaction.isModalSubmit()) await handleModal(interaction);
     else if (interaction.isButton()) await handleButton(interaction);
   } catch (e) {
-    logger.error({ err: e }, "Interaction error");
+    console.error("Interaction error:", e);
     const payload = { embeds: [err("خطأ", "حدث خطأ غير متوقع.")], ephemeral: true } as const;
     try {
       if (interaction.isRepliable()) {
@@ -1007,27 +1147,66 @@ async function handleInteraction(interaction: Interaction) {
 export async function startBot(): Promise<void> {
   const token = process.env["DISCORD_TOKEN"];
   if (!token) {
-    logger.warn("DISCORD_TOKEN not set — Discord bot will not start.");
+    console.warn("DISCORD_TOKEN not set — Discord bot will not start.");
     return;
+  }
+
+  // تسجيل الأوامر تلقائياً
+  const clientId = process.env["DISCORD_CLIENT_ID"];
+  if (clientId) {
+    const rest = new REST().setToken(token);
+    await rest.put(Routes.applicationCommands(clientId), { body: getCommands() });
+    console.log("Slash commands registered globally.");
   }
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   botClient = client;
 
-  client.once("ready", async () => {
-    console.log("Bot Online");
+  client.once("ready", () => {
+    console.log(`Bot online: ${client.user?.tag}`);
     client.user?.setPresence({
-        status: PresenceUpdateStatus.Online,
-        activities: [
-            {
-                name: "Powered By FTRP .",
-                type: ActivityType.Playing,
-            },
-        ],
+      status: PresenceUpdateStatus.Online,
+      activities: [{ name: "Powered By FTRP .", type: ActivityType.Playing }],
     });
-});
+  });
 
   client.on("interactionCreate", handleInteraction);
-  client.on("error", (e) => logger.error({ err: e }, "Discord client error"));
+  client.on("error", (e) => console.error("Discord client error:", e));
   await client.login(token);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════
+
+async function main() {
+  const mongoUri = process.env["MONGODB_URI"];
+  if (!mongoUri) throw new Error("MONGODB_URI environment variable is required");
+
+  await mongoose.connect(mongoUri);
+  console.log("MongoDB connected");
+
+  // HTTP health check — مطلوب لـ Render
+  const port = parseInt(process.env["PORT"] ?? "3000", 10);
+  http.createServer((_, res) => { res.writeHead(200); res.end("OK"); }).listen(port, () => {
+    console.log(`Health check listening on port ${port}`);
+  });
+
+  // Keep-alive — يبعث ping كل 14 دقيقة لمنع النوم
+  const selfUrl = process.env["RENDER_URL"];
+  if (selfUrl) {
+    const ping = selfUrl.startsWith("https") ? require("https") : require("http");
+    setInterval(() => {
+      ping.get(selfUrl, (res: any) => {
+        console.log(`Keep-alive ping → ${res.statusCode}`);
+      }).on("error", (e: any) => {
+        console.warn(`Keep-alive ping failed: ${e.message}`);
+      });
+    }, 14 * 60 * 1000);
+    console.log(`Keep-alive enabled → ${selfUrl}`);
+  }
+
+  await startBot();
+}
+
+main().catch((e) => { console.error("Fatal error:", e); process.exit(1); });
